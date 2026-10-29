@@ -1,0 +1,83 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest -v
+
+  deploy:
+    name: Deploy to local server
+    needs: test
+    # Self-hosted runner на ВМ 192.168.188.143: GitHub-облако в локальную сеть не достучится.
+    runs-on: [self-hosted, linux]
+    # PR из форков на self-hosted runner не пускаем: чужой код выполнился бы на вашем сервере.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    environment: production
+    # Не даем двум деплоям идти одновременно на один сервер.
+    concurrency:
+      group: deploy-local-server
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env from secrets
+        env:
+          APP_NAME: ${{ vars.APP_NAME || 'TaskBoard' }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+        run: |
+          umask 077
+          cat > .env <<EOF
+          APP_NAME=${APP_NAME}
+          POSTGRES_DB=${POSTGRES_DB}
+          POSTGRES_USER=${POSTGRES_USER}
+          POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+          DATABASE_URL=postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+          EOF
+
+      - name: Build and start containers
+        run: docker compose -p taskboard up -d --build --remove-orphans
+
+      - name: Wait for healthcheck
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8888/api/health; then
+              echo; echo "TaskBoard is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Healthcheck failed"
+          docker compose -p taskboard ps
+          docker compose -p taskboard logs --tail=100 app
+          exit 1
+
+      - name: Remove dangling images
+        if: always()
+        run: docker image prune -f
+
+      - name: Remove .env
+        if: always()
+        run: rm -f .env
